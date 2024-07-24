@@ -1,0 +1,302 @@
+---
+title: "Cable Bay Forest Structure Mapping"
+author: "Harry Seely"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(lidR)
+library(here)
+library(sf)
+library(future)
+library(terra)
+library(raster)
+library(mapview)
+
+
+```
+
+```{r}
+
+in_lidar_dir <- here("data/lidar/bc_als_tiles")
+
+ctg <- readLAScatalog(in_lidar_dir)
+
+roi <- st_read(here("data/roi.gpkg"))
+```
+
+
+```{r}
+plot(ctg)
+plot(roi, add=T)
+```
+Check the chunk size
+
+```{r}
+
+opt_chunk_size(ctg) <- 1000 # Processing chunks of 1000 x 1000
+plot(ctg, chunk = TRUE)
+
+```
+
+
+Use lasR to derive height normalized point clouds           
+
+```{r}
+
+#Set output dir for clipped las files
+opt_output_files(ctg) <- here("data/lidar/las_clipped/clipped_{XCENTER}_{YCENTER}_{ID}")
+
+#Set parallel processing
+plan(multisession, workers = 3L)
+
+#Perform height normalization
+ctg_norm <- clip_roi(ctg, geometry = roi)
+
+
+```
+Clip to roi to speed up processing
+
+```{r}
+ctg_clip <- readLAScatalog(here("data/lidar/las_clipped"))
+plot(ctg_clip)
+plot(roi, add=T)
+
+```
+Generate DTM
+
+```{r}
+
+opt_chunk_size(ctg_clip) <- 1000 # Processing chunks of 1000 x 1000
+plot(ctg_clip, chunk = TRUE)
+dem <- rasterize_terrain(ctg_clip, 2, tin(), pkg = "terra")
+
+#Clip to roi
+dem <- dem %>%
+  terra::crop(y = vect(roi)) %>%
+  terra::mask(mask = vect(roi))
+
+plot(dem)
+
+#Save DEM
+writeRaster(dem, here("data/dem.tif"), overwrite=T)
+
+
+```
+
+Perform height normalization using DEM
+
+```{r}
+
+#Set output dir for height normalized las files
+opt_output_files(ctg_clip) <- here("data/lidar/las_normalized/clipped_{XCENTER}_{YCENTER}_{ID}")
+
+#Normalize height
+ctg_norm <- normalize_height(ctg_clip, algorithm=tin(), dtm=dem)
+
+```
+Generate CHM
+
+```{r}
+
+#Check one of the normalized las files for quality 
+las <- readLAS(here("data/lidar/las_normalized/clipped_440500_5441500_3.las"))
+
+#Function to classify and filter noise using sor()
+filter_noise <- function(las) {
+
+    # Classify and filter noise
+    las <- classify_noise(las, algorithm = sor())
+    output <- filter_poi(las, Classification != 18)
+    
+   return(output)
+}
+
+#Test filtering noise
+las_filt <- filter_noise(las)
+
+#Compare before/after noise filtering
+hist(las@data$Z, main = "Pre-Filtered Histogram")
+hist(las_filt@data$Z, main = "Filtered Histogram")
+
+
+```
+
+Filter noise and outliers
+
+```{r}
+
+#Update out dir
+opt_output_files(ctg_norm) <- here("data/lidar/las_noise_rm/noise_rm_{XCENTER}_{YCENTER}_{ID}")
+
+#Remove noise
+ctg_noise_rm <- catalog_map(ctg_norm, filter_noise)
+
+```
+
+
+Test different CHM generation methods
+
+```{r}
+
+ctg_noise_rm <- readLAScatalog(here("data/lidar/las_noise_rm"))
+
+chm <- rasterize_canopy(ctg_noise_rm, 
+                        res = 0.5, 
+                        pitfree(thresholds = c(0, 10, 20), 
+                                max_edge = c(0, 1.5)))
+
+#Crop CHM to roi
+chm <- chm %>%
+  terra::crop(y = vect(roi)) %>%
+  terra::mask(mask = vect(roi))
+
+plot(chm)
+
+#Export CHM
+writeRaster(chm, here("data/chm.tif"), overwrite=T)
+
+```
+
+Test individual tree segmentation on a small sample point cloud
+
+```{r}
+
+#Load CHM
+chm <- rast(here("data/chm.tif"))
+
+#Load a test las
+las <- readLAS(here("data/lidar/las_noise_rm/clipped_439500_5442500_5.las"))
+
+#Get mean coords for las center and adjust to get target position
+x <- mean(las@data$X) + 30
+y <- mean(las@data$Y) + 50
+
+coords_df <- data.frame(x=x,y=y)
+
+test_plot <- st_as_sf(coords_df, 
+              coords = c("x", "y"), 
+              crs = lidR::crs(las)) %>%
+  st_buffer(dist = 30)
+
+#View location of test plot relative to CHM
+plot(chm)
+plot(test_plot, add = T)
+
+#Clip las to test plot
+test_las <- clip_roi(las, test_plot)
+rm(las)
+
+```
+View test las
+
+```{r}
+
+plot(test_las)
+
+```
+
+Check find trees affectiveness on test las
+
+```{r}
+test_chm <- rasterize_canopy(test_las, 
+                        res = 0.5, 
+                        pitfree(thresholds = c(0, 10, 20), 
+                                max_edge = c(0, 1.5)))
+
+test_treetops <- locate_trees(test_chm, lmf(6))
+plot(test_las) |> add_treetops3d(test_treetops)
+
+```
+
+
+```{r}
+
+#Check segmentation on test las
+test_las <- segment_trees(test_las, 
+              algorithm = silva2016(test_chm, 
+                          test_treetops, 
+                          max_cr_factor = 0.6, 
+                          exclusion = 0.3, 
+                          ID = "treeID"), 
+              attribute = "treeID", 
+              uniqueness = "incremental")
+
+plot(test_las, color = "treeID")
+
+
+
+```
+
+Write function to segment trees
+
+```{r}
+
+seg_trees <- function(las){
+  
+  chm <- rasterize_canopy(las, 
+                        res = 0.5, 
+                        pitfree(thresholds = c(0, 10, 20), 
+                                max_edge = c(0, 1.5)))
+  
+  treetops <- locate_trees(chm, lmf(6))
+  
+  output <- segment_trees(las, 
+              algorithm = silva2016(chm, 
+                          treetops, 
+                          max_cr_factor = 0.6, 
+                          exclusion = 0.3, 
+                          ID = "treeID"), 
+              attribute = "treeID", 
+              uniqueness = "incremental")
+  
+  return(output)
+  
+}
+
+#Test function
+test_las <- seg_trees(test_las)
+
+plot(test_las, color="treeID")
+```
+
+
+Locate treetops across entire forest
+
+```{r}
+
+ctg_noise_rm <- readLAScatalog(here("data/lidar/las_noise_rm"))
+
+#Set output
+opt_output_files(ctg_noise_rm) <- here("data/lidar/las_itd/itd_{XCENTER}_{YCENTER}_{ID}")
+
+#Perform segmentation
+ctg_itd <- catalog_map(ctg_noise_rm, seg_trees)
+
+```
+
+Compute crown metrics for each tree
+
+```{r}
+
+#Check out one of the processed chunks
+ctg_itd <- readLAScatalog(here("data/lidar/las_itd"))
+
+#Get per tree summary metrics
+crowns_sf <- crown_metrics(ctg_itd, 
+                           .stdtreemetrics,
+                           geom = "convex",
+                           attribute = "treeID"
+                           )
+
+plot(crowns_sf)
+
+st_write(crowns_sf, dsn = here("data/segmented_tree_crowns.gpkg"), append = F)
+
+```
+
